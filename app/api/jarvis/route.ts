@@ -20,7 +20,10 @@ type LlmTurn = {
 };
 
 function cleanJson(text: string) {
-  return text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  return start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned;
 }
 
 async function callOpenRouter(messages: Array<{ role: "system" | "user"; content: string }>) {
@@ -38,9 +41,7 @@ async function callOpenRouter(messages: Array<{ role: "system" | "user"; content
     },
     body: JSON.stringify({
       model,
-      temperature: 0.35,
       max_tokens: 650,
-      response_format: { type: "json_object" },
       messages,
     }),
   });
@@ -48,7 +49,14 @@ async function callOpenRouter(messages: Array<{ role: "system" | "user"; content
   if (!response.ok) {
     const detail = await response.text();
     console.error("OpenRouter request failed", response.status, detail);
-    throw new Error(`OpenRouter returned ${response.status}.`);
+    let message = detail;
+    try {
+      const parsed = JSON.parse(detail) as { error?: { message?: string } };
+      message = parsed.error?.message || detail;
+    } catch {
+      // Keep the provider's plain-text error when it is not JSON.
+    }
+    throw new Error(`OpenRouter ${response.status}: ${message.slice(0, 240)}`);
   }
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content;
@@ -81,16 +89,24 @@ Do not create tasks unless the user actually requests one. Do not store transien
     },
   ]);
 
-  const parsed = JSON.parse(cleanJson(raw)) as Partial<LlmTurn>;
-  if (!parsed.response || typeof parsed.response !== "string") {
-    throw new Error("Jarvis could not parse the model response.");
+  try {
+    const parsed = JSON.parse(cleanJson(raw)) as Partial<LlmTurn>;
+    if (parsed.response && typeof parsed.response === "string") {
+      return {
+        response: parsed.response,
+        facts: Array.isArray(parsed.facts) ? parsed.facts.filter((item): item is string => typeof item === "string") : [],
+        tasks: Array.isArray(parsed.tasks)
+          ? parsed.tasks.filter((item): item is JarvisTask => Boolean(item && typeof item.title === "string"))
+          : [],
+      };
+    }
+  } catch {
+    // Models without JSON mode may answer in prose. Text chat should still work.
   }
   return {
-    response: parsed.response,
-    facts: Array.isArray(parsed.facts) ? parsed.facts.filter((item): item is string => typeof item === "string") : [],
-    tasks: Array.isArray(parsed.tasks)
-      ? parsed.tasks.filter((item): item is JarvisTask => Boolean(item && typeof item.title === "string"))
-      : [],
+    response: raw.trim(),
+    facts: [],
+    tasks: [],
   };
 }
 
@@ -106,8 +122,30 @@ async function makeBriefing(tasks: Awaited<ReturnType<typeof openTasks>>) {
     },
     { role: "user", content: `Current time: ${new Date().toISOString()}\nOpen tasks:\n${JSON.stringify(tasks)}` },
   ]);
-  const parsed = JSON.parse(cleanJson(raw)) as { briefing?: string };
-  return parsed.briefing || "Your briefing is ready, but the summary channel returned no text.";
+  try {
+    const parsed = JSON.parse(cleanJson(raw)) as { briefing?: string };
+    if (parsed.briefing) return parsed.briefing;
+  } catch {
+    // Plain-text output is valid for models without JSON mode.
+  }
+  return raw.trim() || "Your briefing is ready, but the model returned no text.";
+}
+
+async function listOpenRouterModels() {
+  const apiKey = configValue("openRouterApiKey", "OPENROUTER_API_KEY");
+  if (!apiKey) return [];
+  const response = await fetch("https://openrouter.ai/api/v1/models?output_modalities=text", {
+    headers: { authorization: `Bearer ${apiKey}` },
+    cache: "no-store",
+  });
+  if (!response.ok) return [];
+  const data = (await response.json()) as {
+    data?: Array<{ id?: string; name?: string; architecture?: { output_modalities?: string[] } }>;
+  };
+  return (data.data || [])
+    .filter((model) => typeof model.id === "string" && model.architecture?.output_modalities?.includes("text"))
+    .map((model) => ({ id: model.id as string, name: model.name || (model.id as string) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function errorResponse(error: unknown, status = 500) {
@@ -128,8 +166,27 @@ export async function POST(request: Request) {
       return NextResponse.json({ config: configStatus() });
     }
 
+    if (action === "models") {
+      return NextResponse.json({ models: await listOpenRouterModels() });
+    }
+
     if (action === "init") {
       return NextResponse.json({ ...(await createJarvisSession()), config: configStatus() });
+    }
+
+    if (action === "chat") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) return errorResponse(new Error("I didn't catch that."), 400);
+      const result = await answerTurn(text, [], []);
+      return NextResponse.json({
+        ...result,
+        memoryMs: 0,
+        recalled: 0,
+        persisted: { stored: 0, synced: false },
+        memoryOnline: false,
+        localMossReady: false,
+        memoryError: "No memory session was available for this turn.",
+      });
     }
 
     const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
@@ -138,6 +195,13 @@ export async function POST(request: Request) {
     if (action === "briefing") {
       const tasks = await openTasks(sessionId);
       return NextResponse.json({ briefing: await makeBriefing(tasks), tasks });
+    }
+
+    if (action === "memory-search") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) return errorResponse(new Error("Missing memory search text."), 400);
+      const memory = await queryBoth(sessionId, text, 5);
+      return NextResponse.json(memory);
     }
 
     if (action === "turn") {
@@ -155,6 +219,10 @@ export async function POST(request: Request) {
         memoryMs: memory.elapsedMs,
         recalled: memory.working.length + memory.longTerm.length,
         persisted,
+        memoryDocs: persisted.stored,
+        memoryOnline: persisted.synced,
+        localMossReady: persisted.localMossReady,
+        memoryError: persisted.error || memory.memoryError,
       });
     }
 

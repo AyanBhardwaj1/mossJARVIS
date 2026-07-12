@@ -8,8 +8,9 @@
     "build": "next build",
     "typecheck": "tsc --noEmit",
     "desktop": "tauri dev",
-    "prepare:desktop": "next build && mkdir -p .next/standalone/.next && cp -R .next/static .next/standalone/.next/ && cp -R public .next/standalone/",
-    "desktop:build": "tauri build"
+    "prepare:desktop": "next build && mkdir -p .next/standalone/.next && cp -R .next/static .next/standalone/.next/ && cp -R public .next/standalone/ && node scripts/prepare-desktop.mjs",
+    "desktop:build": "tauri build",
+    "desktop:launch": "open /Applications/Jarvis.app"
   },
   "dependencies": {
     "@moss-dev/moss": "^1.3.0",

@@ -1,26 +1,36 @@
 # J.A.R.V.I.S.
 
-Jarvis is a voice-activated personal AI assistant with a compact Iron Man-inspired HUD and a persistent “second brain.” It listens locally for the word **Jarvis**, transcribes the following command on-device, recalls relevant short- and long-term context through Moss, generates an answer through OpenRouter, stores useful facts and tasks back in Moss, and speaks the answer with ElevenLabs.
+Jarvis is a text-first personal AI assistant with a compact Iron Man-inspired HUD and a persistent “second brain.” With only Moss and OpenRouter configured, it immediately accepts typed commands, recalls relevant short- and long-term context, generates an answer, and stores useful facts and tasks. Picovoice wake-word/STT and ElevenLabs speech are optional upgrades that activate automatically when their keys are available.
 
 The repository can run as:
 
 - a browser development application at `http://localhost:3000`; or
-- a frameless, transparent, always-on-top Tauri desktop overlay.
+- a frameless, transparent, always-on-top Tauri desktop overlay with its own bundled Node runtime.
+
+## Current implementation status
+
+- Text prompting works with Moss Project ID/Key plus one OpenRouter API key.
+- Any OpenRouter text/chat model slug can be selected; GPT-4.1 Mini is only the default value.
+- Every successful turn is written to private local storage before any Moss Cloud request.
+- Moss local retrieval remains operational when cloud index, ingest, or monthly usage quota is unavailable.
+- The macOS build is self-contained: `Jarvis.app` carries Next.js standalone output, pnpm dependencies, Moss's native Apple Silicon module, and Node itself.
+- Browser and desktop WebView credentials are separate because each has its own `localStorage`.
 
 ## Feature status
 
 | Capability | Implementation |
 | --- | --- |
-| Wake word | Local Picovoice Porcupine Web model using the built-in `Jarvis` keyword |
-| Speech-to-text | Local Picovoice Cheetah streaming transcription with endpoint detection |
+| Text conversation | Core mode; requires only Moss and OpenRouter |
+| Wake word | Optional local Picovoice Porcupine Web model using the built-in `Jarvis` keyword |
+| Speech-to-text | Optional local Picovoice Cheetah streaming transcription with endpoint detection |
 | Conversational reasoning | OpenRouter Chat Completions with a configurable model |
-| Live conversational memory | Moss `SessionIndex` containing the current interaction's turns |
-| Persistent second brain | Moss cloud-backed index containing summaries, facts, preferences, and tasks |
+| Live conversational memory | In-process recent-turn buffer plus a Moss local `SessionIndex` |
+| Persistent second brain | Private local JSON + Moss local index, with automatic Moss Cloud synchronization when quota permits |
 | Task capture | OpenRouter returns structured tasks; Jarvis stores them as Moss documents with metadata |
 | Morning briefing | Reads open task documents from Moss and asks OpenRouter to produce a concise spoken briefing |
-| Speech output | ElevenLabs text-to-speech, with browser/OS speech synthesis as a development fallback |
+| Speech output | Optional ElevenLabs text-to-speech; OS speech synthesis is used only if an enabled ElevenLabs request/playback fails |
 | Desktop shell | Tauri 2 frameless, transparent, resizable, always-on-top window |
-| Text fallback | HUD command bar sends the same turns through the full Moss → OpenRouter → Moss pipeline |
+| Text command channel | HUD command bar performs local recall → OpenRouter → local persistence → optional Moss Cloud sync |
 | Runtime configuration | Masked in-app credential form plus `.env.local` support |
 
 ## What each component contributes
@@ -31,17 +41,17 @@ Moss is the foundation of Jarvis's second brain. It is not the language model an
 
 In this project Moss contributes:
 
-1. **Local embeddings.** Documents added to a `SessionIndex` are embedded by Moss's bundled Rust runtime using the default `moss-minilm` model. Jarvis does not call OpenAI or another embedding API.
-2. **Short-term working memory.** The current conversation is written into a local Moss session with `addDocs()` and searched with `query()`.
-3. **Long-term semantic memory.** The stable `jarvis-second-brain` index holds durable conversation records, extracted facts, preferences, and task documents.
-4. **Retrieval before every answer.** Jarvis searches both the working session and the loaded long-term index in parallel. The top five results from each source are included in the OpenRouter prompt.
-5. **Local query execution.** After the long-term index is loaded with `loadIndex()`, retrieval runs in the application process rather than making a network round trip for every query.
+1. **Local embeddings.** Jarvis produces deterministic 384-dimensional embeddings on-device and supplies them to Moss as BYO/custom embeddings. This avoids a separate embedding API and continues working when hosted Moss embedding/voice quota is exhausted.
+2. **Short-term working memory.** The current conversation is held in a bounded in-process recent-turn buffer.
+3. **Long-term semantic memory.** A Moss local `SessionIndex` searches the stable second-brain documents. The same documents are saved first to `.jarvis-data/second-brain.json`, so a server restart cannot erase successful turns.
+4. **Retrieval before every answer.** Jarvis searches recent working turns and the Moss local long-term index. Up to five results from each source are included in the OpenRouter prompt.
+5. **Local query execution.** The custom-embedding `SessionIndex` is queried in-process. When cloud sync is online, Jarvis can additionally query the loaded `jarvis-second-brain` cloud snapshot and merge those results.
 6. **Metadata-bearing documents.** Facts, conversation records, system records, and tasks are differentiated using document metadata. Task metadata makes the memory filterable by fields such as type, status, due date, recurrence, and priority.
-7. **Cloud persistence.** New long-term documents are first added locally, then uploaded with `pushIndex()`. Moss persists the index under its stable name so another process or future Jarvis session can resume it.
-8. **Hydration and refresh.** Jarvis loads the cloud index at startup and reloads it after a push so `MossClient.query()` sees the latest durable state.
+7. **Cloud persistence.** When the project has available Moss quota, Jarvis creates or updates the single `jarvis-second-brain` cloud index through `createIndex()` / `addDocs()` and refreshes it with `loadIndex()`.
+8. **Fail-safe persistence.** If Moss Cloud returns a quota or network error, the HUD reports `MOSS LOCAL`; the turn is still stored on disk and indexed by the local Moss engine. A later initialization retries cloud synchronization.
 9. **Retrieval telemetry.** Query duration and retrieved-document counts are exposed in the HUD as Moss latency and memory recall metrics.
 
-This follows Moss's documented **create/resume → mutate locally → query locally → push** lifecycle. See the [Moss sessions guide](https://docs.moss.dev/docs/integrate/sessions) and [live-call context guide](https://docs.moss.dev/docs/build/live-call-context).
+This uses Moss's documented custom-embedding, local-session, index mutation, `loadIndex()`, and query APIs. See the [Moss client reference](https://docs.moss.dev/docs/reference/js/classes/MossClient) and [storage/persistence guide](https://docs.moss.dev/docs/integrate/storage-persistence).
 
 ### What Moss does not do here
 
@@ -52,15 +62,15 @@ Clear ownership matters:
 - Moss does **not** listen to the microphone; Picovoice does.
 - Moss does **not** synthesize audio; ElevenLabs does.
 - Moss is not currently used as a clock-based notification scheduler. It stores task state and makes it retrievable for briefings.
-- Open task selection currently calls `longTerm.getDocs()` and filters the returned metadata in the Node process. The documents are compatible with Moss metadata filters, but the current briefing path does not yet issue a filtered Moss query.
+- Open task selection currently filters the session's durable local document collection in the Node process. Task documents remain compatible with Moss metadata filters, but the briefing path does not yet issue a filtered Moss query.
 
-### OpenRouter: reasoning and structured extraction
+### OpenRouter: model-agnostic reasoning and structured extraction
 
 All conversational model calls go through OpenRouter. The model receives:
 
 - the current user command;
-- relevant documents retrieved from the live Moss session;
-- relevant documents retrieved from the persistent Moss index; and
+- relevant recent working-memory documents;
+- relevant documents retrieved from the Moss local/cloud second-brain index; and
 - instructions to return strict JSON containing a spoken response, durable facts, and structured tasks.
 
 The expected response shape is:
@@ -80,7 +90,9 @@ The expected response shape is:
 }
 ```
 
-Jarvis validates this structure before storing it. The model is configured with `OPENROUTER_MODEL`, so it can be replaced without changing code.
+Jarvis validates this structure before storing it. The model is configured with `OPENROUTER_MODEL`, so it can be replaced without changing code. The in-app model field is free-form and also loads suggestions from OpenRouter's model catalog. Enter the exact OpenRouter model ID, such as an `anthropic/...`, `google/...`, `meta-llama/...`, or `openai/...` slug. The OpenRouter API key belongs to the OpenRouter account, not to GPT-4.1 Mini.
+
+Jarvis deliberately does not require the provider-specific `response_format` option. This keeps ordinary text chat compatible with models that do not advertise native JSON or structured-output support. Models that follow the JSON instruction provide full task and durable-fact extraction; if a model answers with plain prose, Jarvis still displays the answer but skips structured fact/task extraction for that turn.
 
 ### Picovoice: local audio intelligence
 
@@ -103,7 +115,7 @@ The first initialization is slower because the 34 MB Cheetah model must be loade
 - voice ID `JBFqnCBsd6RMkjVDRZzb` (George); and
 - model `eleven_multilingual_v2`.
 
-If ElevenLabs is missing or playback fails, the development UI attempts to use the operating system's `en-GB` speech-synthesis voice. That fallback is useful for testing but is not equivalent to ElevenLabs quality.
+When ElevenLabs is not configured, Jarvis stays in text-only output mode. If ElevenLabs is configured but its request or playback fails, the UI attempts to use the operating system's `en-GB` speech-synthesis voice. That fallback is useful for recovery but is not equivalent to ElevenLabs quality.
 
 ### Next.js: application and orchestration layer
 
@@ -119,7 +131,28 @@ Tauri wraps the Next.js application in a native macOS window configured as:
 - always on top; and
 - draggable through the custom HUD title bar.
 
-The production build bundles Next.js standalone output as a Tauri resource. The current packaged design launches that server with the target machine's system `node` executable, so Node.js 20+ remains a runtime requirement.
+The production build bundles both Next.js standalone output and the build machine's Node executable as Tauri resources. The Finder-launched application therefore starts its own loopback server without depending on shell PATH configuration or a separate system Node installation.
+
+## Minimum text-only mode
+
+The minimum working configuration is:
+
+```env
+MOSS_PROJECT_ID=your_project_id
+MOSS_PROJECT_KEY=your_project_key
+OPENROUTER_API_KEY=your_openrouter_api_key
+```
+
+With those three values, Jarvis can:
+
+- accept typed prompts through the HUD;
+- query short- and long-term Moss memory;
+- answer through OpenRouter;
+- extract and persist facts and tasks;
+- generate text morning briefings; and
+- retain the entire visual HUD and reactor state system.
+
+It will not request microphone access, initialize Picovoice, call ElevenLabs, or attempt speech playback. Clicking the central reactor focuses the text-command field instead.
 
 ## End-to-end voice turn
 
@@ -135,11 +168,11 @@ The production build bundles Next.js standalone output as a Tauri resource. The 
         ▼
 4. POST /api/jarvis { action: "turn" }
         │
-        ├── add user turn to Moss working SessionIndex
+        ├── add user turn to recent working memory
         │
-        ├── query working SessionIndex (top 5)
+        ├── query recent working memory (top 5)
         │
-        └── query loaded long-term Moss index (top 5)
+        └── query Moss local second-brain index (top 5)
                     │
                     ▼
 5. Combined retrieved context → OpenRouter
@@ -147,17 +180,17 @@ The production build bundles Next.js standalone output as a Tauri resource. The 
                     ▼
 6. JSON response: spoken answer + facts + tasks
         │
-        ├── add assistant turn to working SessionIndex
+        ├── add assistant turn to recent working memory
         │
-        ├── add conversation record to long-term SessionIndex
+        ├── write conversation record to private local storage
         │
         ├── add extracted fact documents
         │
         ├── add structured task documents
         │
-        ├── pushIndex() to Moss Cloud
+        ├── update Moss local SessionIndex
         │
-        └── loadIndex() to refresh the local durable runtime
+        └── addDocs() + loadIndex() for Moss Cloud when quota is available
                     │
                     ▼
 7. Answer → ElevenLabs → MP3 → speaker
@@ -169,11 +202,7 @@ The text command bar begins at step 4 and otherwise uses the identical pipeline.
 
 The implementation lives in [`lib/jarvis-store.ts`](./lib/jarvis-store.ts).
 
-### Working session: short-term context
-
-```ts
-const working = await client.session(`jarvis-working-${dayKey()}`);
-```
+### Working memory: short-term context
 
 Each user and assistant turn is stored as a document like:
 
@@ -189,16 +218,17 @@ Each user and assistant turn is stored as a document like:
 }
 ```
 
-The working session is intentionally not pushed after every turn. It is short-lived context for the active API session. Durable information from the exchange is written separately into the second-brain session. Consequently, raw working turns do not currently survive a process restart unless a cloud index with that working-session name was created elsewhere.
+Working memory keeps the latest 40 raw user/assistant turns in the active Node process. Every completed exchange is also written as a durable `conversation-summary`, so it survives even though the raw working buffer is intentionally short-lived.
 
-### Long-term session: durable second brain
+### Long-term memory: local first, Moss synchronized
 
 ```ts
-const longTerm = await client.session("jarvis-second-brain");
-await client.loadIndex("jarvis-second-brain");
+const localIndex = await client.session("jarvis-local-second-brain", "custom");
+await localIndex.addDocs(documentsWithLocalEmbeddings);
+await localIndex.saveToDisk("second-brain.moss");
 ```
 
-`client.session(name)` is create-or-resume: Moss loads the existing cloud index when it exists and otherwise starts with an empty session. On a new account, Jarvis adds a bootstrap system document and pushes it to create the long-term cloud index.
+The canonical local document store is `.jarvis-data/second-brain.json` in development. The packaged desktop app sets `JARVIS_DATA_DIR` to the macOS application-data directory, so memory is writable outside the read-only app bundle. Files are created with owner-only permissions.
 
 After each successful model turn, Jarvis adds:
 
@@ -206,28 +236,28 @@ After each successful model turn, Jarvis adds:
 - zero or more durable fact documents; and
 - zero or more structured task documents.
 
-It then calls:
+Jarvis saves the local document file before attempting network synchronization. If Moss Cloud is available, it then uses:
 
 ```ts
-await longTerm.addDocs(documents);
-await longTerm.pushIndex();
+await client.addDocs("jarvis-second-brain", documentsWithLocalEmbeddings);
 await client.loadIndex("jarvis-second-brain");
 ```
 
-This makes the new memory durable and refreshes the locally queryable long-term index.
+If the cloud index does not exist, Jarvis creates it once with `createIndex(..., { modelId: "custom" })`. If cloud quota is exhausted, local persistence and Moss local retrieval remain active and the next initialization retries the sync.
 
 ### Parallel retrieval
 
 Before OpenRouter generates an answer, Jarvis performs:
 
 ```ts
-const [working, longTerm] = await Promise.all([
-  session.working.query(userText, { topK: 5 }),
-  session.client.query(session.longTermIndex, userText, { topK: 5 }),
-]);
+const working = searchRecentTurns(userText, 5);
+const longTerm = await session.localIndex.query(userText, {
+  topK: 5,
+  embedding: localEmbedding(userText),
+});
 ```
 
-Results carry a `working` or `long-term` source label so the prompt preserves the memory boundary. Moss relevance scores are available on the returned documents; Jarvis currently passes the retrieved text and source into the model prompt.
+Results carry a `working` or `long-term` source label so the prompt preserves the memory boundary. When Moss Cloud is synchronized, Jarvis can also query the loaded cloud snapshot and merge those results.
 
 ### Memory document types
 
@@ -262,11 +292,11 @@ Moss evaluates metadata filtering on a locally loaded index. This schema is read
 
 The morning briefing path is deliberately separate from a normal turn:
 
-1. `openTasks()` reads documents from the long-term Moss session.
+1. `openTasks()` reads documents from the durable local second-brain collection.
 2. Jarvis keeps documents with `metadata.type === "task"` and `metadata.status === "open"`.
 3. OpenRouter receives the structured open-task list and current timestamp.
 4. The resulting briefing prioritizes overdue, due-today, and high-priority items.
-5. ElevenLabs speaks the briefing.
+5. ElevenLabs speaks the briefing when configured; otherwise it remains text in the HUD.
 
 When no task documents are open, Jarvis returns a deterministic no-tasks briefing without spending an OpenRouter request.
 
@@ -281,47 +311,51 @@ app/
     └── tts/route.ts            ElevenLabs text-to-speech proxy
 
 lib/
-├── jarvis-store.ts             Moss client, sessions, dual retrieval, persistence, tasks
+├── jarvis-store.ts             Local-first store, custom embeddings, Moss sync/retrieval, tasks
 ├── runtime-config.ts           Runtime provider configuration and environment fallback
 └── voice-engine.ts             Porcupine/Cheetah worker lifecycle and microphone routing
+
+scripts/
+└── prepare-desktop.mjs         Materializes pnpm packages and embeds the active Node executable
 
 public/models/
 ├── porcupine_params.pv         Local wake-word parameters
 └── cheetah_params.pv           Local streaming STT parameters
 
 src-tauri/
-├── src/lib.rs                  Native server process and HUD window creation
+├── icons/                      Jarvis SVG/PNG application icon
+├── src/lib.rs                  Bundled server process, NODE_PATH, data directory, and HUD window
 ├── tauri.conf.json             Tauri build, bundle, security, and resource configuration
-└── capabilities/default.json   Window permissions
+├── capabilities/default.json   Window permissions
+└── Cargo.lock                  Reproducible Rust dependency lockfile
 ```
 
 ## Requirements
 
 - Node.js 20 or newer
-- npm; pnpm also works
+- pnpm (used by the development and Tauri build scripts)
 - Rust stable
 - [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/)
 - Moss project credentials
 - OpenRouter API key with access to the configured model
-- ElevenLabs API key with text-to-speech permission
-- Picovoice AccessKey
-- Microphone permission
-- Internet access for Moss synchronization, OpenRouter generation, and ElevenLabs speech
+- Optional: ElevenLabs API key with text-to-speech permission
+- Optional: Picovoice AccessKey and microphone permission
+- Internet access for Moss synchronization and OpenRouter generation; ElevenLabs also requires it when enabled
 
-Wake-word detection and speech-to-text run locally after the Picovoice models have initialized. Moss queries run locally after index hydration, but opening/pushing a cloud index requires network access.
+Wake-word detection and speech-to-text run locally after the Picovoice models have initialized. The Moss local second brain and disk persistence work without cloud access; creating/updating the optional cloud index requires network access and available Moss project quota.
 
 ## Installation
 
 ```bash
 git clone <repository-url>
 cd <repository-directory>
-npm install
+pnpm install
 cp .env.local.example .env.local
 ```
 
 ### Credential option A: `.env.local`
 
-Fill in:
+For text-only mode, fill in:
 
 ```env
 MOSS_PROJECT_ID=your_project_id
@@ -330,6 +364,13 @@ MOSS_LONG_TERM_INDEX=jarvis-second-brain
 
 OPENROUTER_API_KEY=your_openrouter_api_key
 OPENROUTER_MODEL=openai/gpt-4.1-mini
+```
+
+`openai/gpt-4.1-mini` is only the example default. Replace it with any text/chat model ID currently available to your OpenRouter account. You can also change the model at runtime in **CONFIG → OPENROUTER → MODEL SLUG**; no rebuild is required.
+
+Optionally add spoken input and output:
+
+```env
 
 ELEVENLABS_API_KEY=your_elevenlabs_api_key
 ELEVENLABS_VOICE_ID=JBFqnCBsd6RMkjVDRZzb
@@ -345,16 +386,18 @@ Restart the development server after changing `.env.local`.
 
 ### Credential option B: in-app configuration
 
-Open **CONFIG** or the top-right settings control. Enter the credentials and select **SAVE KEYS & INITIALIZE CORE**.
+Open **CONFIG** or the top-right settings control. Enter the required Moss and OpenRouter credentials, choose or type an OpenRouter model slug, then select **SAVE & INITIALIZE TEXT CORE**. The model suggestions are loaded from OpenRouter, but the field remains free-form so a newly released model can be used immediately. The ElevenLabs and Picovoice sections are explicitly marked optional and may be left blank.
 
 Runtime configuration behavior:
 
-- values are stored in the current browser's `localStorage`;
+- values are stored in the current browser/WebView's `localStorage`;
 - values are sent to the local `/api/jarvis` route and retained in server memory;
 - non-empty runtime values override `.env.local` values for the current process;
 - a blank runtime field leaves an existing server environment value unchanged;
-- the Moss session is initialized immediately, without restarting Next.js; and
+- local memory and Moss synchronization are initialized immediately, without restarting Next.js; and
 - credentials must be re-injected from browser storage after the Node process restarts.
+
+Chrome/Safari development storage and the Tauri WebView storage are intentionally separate. Enter the credentials once in the native CONFIG panel after first launching `Jarvis.app`.
 
 The masked inputs prevent shoulder surfing, but `localStorage` is not encrypted secret storage. For stricter server-side secrecy, use `.env.local`. `NEXT_PUBLIC_PICOVOICE_ACCESS_KEY` is necessarily available to the browser because the Picovoice Web SDK runs client-side.
 
@@ -363,7 +406,7 @@ The masked inputs prevent shoulder surfing, but `localStorage` is not encrypted 
 ### Browser development mode
 
 ```bash
-npm run dev
+pnpm dev
 ```
 
 Open `http://localhost:3000`.
@@ -371,34 +414,61 @@ Open `http://localhost:3000`.
 ### Tauri desktop mode
 
 ```bash
-npm run desktop
+rustup default stable
+pnpm desktop
 ```
 
-The first Rust/Tauri compilation can take several minutes and requires multiple gigabytes of free disk space.
+The first Rust/Tauri compilation can take several minutes and requires at least 5 GB of free disk space. Development mode launches the frameless, always-on-top native window against the local Next.js server.
 
-### First voice activation
+### Optional voice activation
 
-1. Complete the System Configuration panel.
-2. Click **ARM VOICE** or the central reactor.
-3. Allow microphone access.
-4. Wait for `WAKE LINK ARMED`.
-5. Say “Jarvis.”
-6. Speak a command and pause naturally.
+1. Add both the optional ElevenLabs and Picovoice credentials.
+2. Save the configuration.
+3. Click **ARM VOICE** or the central reactor.
+4. Allow microphone access.
+5. Wait for `WAKE LINK ARMED`.
+6. Say “Jarvis,” speak a command, and pause naturally.
+
+Without optional voice credentials, type into the command bar and press **TRANSMIT**. Responses appear immediately as HUD telemetry.
 
 ## Production build
 
 ```bash
-npm run desktop:build
+pnpm desktop:build
 ```
 
 This command:
 
 1. creates Next.js standalone output;
 2. copies static and public assets into the standalone server;
-3. bundles that server as a Tauri resource; and
-4. builds the native application bundle.
+3. dereferences pnpm links into `.desktop-server` so packages resolve inside an app bundle;
+4. materializes `@moss-dev/moss-core` and its architecture-specific native package;
+5. copies the active Node executable into Tauri resources;
+6. compiles the Rust launcher; and
+7. creates `src-tauri/target/release/bundle/macos/Jarvis.app`.
 
-The current native launcher executes `node server.js`, so the target machine must have Node.js 20+ available on its system PATH.
+`scripts/prepare-desktop.mjs` copies the active Node executable into the app bundle, and the Rust launcher executes that exact bundled path.
+
+Install the generated bundle once:
+
+```bash
+ditto src-tauri/target/release/bundle/macos/Jarvis.app /Applications/Jarvis.app
+pnpm desktop:launch
+```
+
+`desktop:launch` opens `/Applications/Jarvis.app`, so it requires the installation copy step first.
+
+The native launcher passes the macOS application-data directory to the server as `JARVIS_DATA_DIR`, so second-brain files survive app upgrades and are never written inside the application bundle.
+
+The bundled Node executable is architecture-specific. Build the macOS app on the same architecture you intend to distribute, or add separate universal/Intel packaging if needed.
+
+### Launching and stopping the installed app
+
+```bash
+open /Applications/Jarvis.app
+```
+
+Quit from the app/window normally. The Rust launcher owns the bundled `next-server` child and terminates it when Jarvis exits. Jarvis listens only on `127.0.0.1:3000`.
 
 ## API contract
 
@@ -407,9 +477,12 @@ All Jarvis orchestration uses `POST /api/jarvis`.
 | Action | Required fields | Result |
 | --- | --- | --- |
 | `status` | optional `config` | Boolean provider-link status; never returns secret values |
-| `init` | optional `config` | Opens Moss sessions and returns session/index/document metadata |
-| `turn` | `sessionId`, `text` | Returns answer, extracted facts/tasks, recall count, Moss latency, and push count |
+| `models` | optional `config` | OpenRouter text-model catalog for the free-form model suggestions |
+| `init` | optional `config` | Opens local memory, initializes Moss local retrieval, attempts cloud sync, and returns truthful memory status |
+| `turn` | `sessionId`, `text` | Returns answer, extracted facts/tasks, recall count, local document count, and Moss sync status |
+| `chat` | `text` | Emergency direct OpenRouter turn when no memory session can be recovered |
 | `briefing` | `sessionId` | Returns the spoken briefing and current open tasks |
+| `memory-search` | `sessionId`, `text` | Diagnostic retrieval against working and long-term memory |
 
 `POST /api/jarvis/tts` accepts `{ "text": "..." }` and returns `audio/mpeg` when ElevenLabs succeeds.
 
@@ -418,46 +491,91 @@ All Jarvis orchestration uses `POST /api/jarvis`.
 | Data | Destination | Reason |
 | --- | --- | --- |
 | Raw microphone frames | Local Porcupine/Cheetah Web Workers | Wake detection and transcription |
-| User transcript | Local Next.js API, Moss Cloud during pushed persistence, OpenRouter | Memory, retrieval, and response generation |
+| User transcript | Local Next.js API, local memory files, OpenRouter, and Moss Cloud only when sync succeeds | Memory, retrieval, and response generation |
 | Retrieved Moss context | OpenRouter | Grounding the response in relevant memory |
-| Conversation record, extracted facts, tasks | Moss Cloud on `pushIndex()` | Persistence across restarts/devices |
+| Conversation record, extracted facts, tasks | Private local data file first; Moss Cloud through `addDocs()` when available | Guaranteed local persistence and optional cross-device sync |
 | Final response text | ElevenLabs | Speech synthesis |
 | Runtime credentials entered in the UI | Browser `localStorage` and local Next.js process | Runtime provider configuration |
 
 Do not expose this development server to an untrusted network while using browser-stored provider keys.
 
+## Memory and credential locations
+
+| Mode | Second-brain location | Credential location |
+| --- | --- | --- |
+| Browser development | `<repo>/.jarvis-data/second-brain.json` and `second-brain.moss/` | Browser `localStorage` or `.env.local` |
+| Installed macOS app | `~/Library/Application Support/ai.jarvis.secondbrain/` | Tauri WebView `localStorage` |
+
+The JSON memory file is written atomically with owner-only (`0600`) permissions. `second-brain.moss/` is a generated local Moss index; the JSON document store remains the canonical recovery source. `.env.local`, local memories, generated server bundles, embedded Node copies, and Rust build output are ignored by Git.
+
+## GitHub publishing checklist
+
+Before pushing:
+
+```bash
+pnpm typecheck
+git status --short
+```
+
+Commit source files including `src-tauri/Cargo.lock`, `src-tauri/icons/`, and `scripts/prepare-desktop.mjs`. Do not commit:
+
+- `.env.local` or any provider key;
+- `.jarvis-data/` or personal memories;
+- `.next/` or `.desktop-server/`;
+- `src-tauri/resources/node`;
+- `src-tauri/target/`; or
+- the installed `/Applications/Jarvis.app` bundle.
+
+GitHub users build their own architecture-matched Node/Tauri bundle with `pnpm desktop:build`.
+
 ## Failure behavior
 
 | Failure | UI behavior |
 | --- | --- |
-| Missing/invalid Moss credentials | Core enters red `OFFLINE`; configuration panel opens |
+| Missing Moss credentials | Core opens CONFIG and keeps the command channel locked until Moss and OpenRouter values exist |
+| Invalid Moss credentials or unavailable cloud quota | Jarvis can continue as `MOSS LOCAL` when the local engine initializes; the HUD reports the actual cloud error |
 | Missing OpenRouter key | Moss can initialize, but conversational turns fail before generation |
-| Missing ElevenLabs key | Browser/OS speech synthesis is attempted as a fallback |
-| Missing Picovoice key | Text commands still work; wake-word initialization opens configuration |
+| Missing ElevenLabs key | Normal text response; no TTS request or speech playback is attempted |
+| Missing Picovoice key | Normal text mode; the reactor focuses the command field and `ADD VOICE` opens configuration |
 | Microphone denied | Text command bar remains available |
-| Session lost after server restart | Reopen/re-save configuration to create a new Jarvis API session |
-| Moss push failure | Turn reports an error rather than pretending memory persisted |
+| Session lost after server restart or hot reload | The next text prompt automatically creates a replacement Moss session and retries once |
+| Moss Cloud quota/index unavailable | Jarvis reports `MOSS LOCAL`, saves the turn locally, retrieves it through Moss's local engine, and retries cloud sync on a later initialization |
+| Local Moss engine unavailable | Jarvis still stores the turn in the private JSON store and uses deterministic local retrieval |
 
 ## Current limitations
 
 - Task completion, editing, and deletion are not yet exposed in the HUD.
 - Tasks are memory documents, not operating-system notifications or background alarms.
 - Recurrence is stored but not expanded into future task instances.
-- The current working session is not pushed at shutdown; durable records are written to the long-term index after successful model turns.
+- Raw working turns are process-local; completed exchanges are durable conversation documents.
 - Conversation “summaries” currently store the complete user/assistant exchange rather than a separately compressed summary.
 - There is no account/user namespace beyond the configured Moss project and index name.
 - Runtime credentials use browser storage rather than the macOS Keychain or Tauri Stronghold.
-- The native production server depends on a system Node.js installation.
+- The generated macOS app is locally built and not notarized for public distribution.
 
 ## Troubleshooting
 
 ### The HUD says `MOSS CREDENTIALS REQUIRED`
 
-Open **CONFIG**, enter both the Moss Project ID and Project Key, and save. Moss validates credentials when opening a session.
+Open **CONFIG**, enter both the Moss Project ID and Project Key, and save. Their presence unlocks the text-first initialization path; Jarvis then reports whether cloud sync succeeded or local Moss mode is active.
 
 ### Settings say OpenRouter is linked, but turns fail
 
 Confirm that the configured OpenRouter account has credits and access to `OPENROUTER_MODEL`. A linked status only means a key exists; it does not make a paid provider request during the status check.
+
+### The text command field will not accept typing
+
+Text input becomes available as soon as both Moss and OpenRouter show `LINKED`; a temporary Moss session ID is not required just to type. Click the command bar or the central reactor, type a directive, and press Return or **TRANSMIT**. If the Next.js server restarted and invalidated the old in-memory session, Jarvis rebuilds it automatically when the prompt is sent. If the field still says to add credentials, open **CONFIG**, save the two required providers, and hard-refresh the page.
+
+If Moss Cloud rejects synchronization because the project has reached an index, ingest, or monthly usage limit, the HUD displays `MOSS LOCAL`. This is not a memory-loss mode: completed turns are written to the local second brain and indexed by Moss locally. Cloud synchronization resumes after quota becomes available.
+
+### Moss says `Monthly voice minutes limit ... reached`
+
+This response comes from the Moss project API, even when Jarvis itself is in text mode; it is unrelated to ElevenLabs or Picovoice. The local Moss engine remains operational. To restore Moss Cloud sync, use a Moss project whose monthly allowance is available, wait for the billing-period reset, enable pay-as-you-go/upgrade the plan, or ask Moss support to correct the project meter. Entering a different valid Project ID and Project Key in **CONFIG** immediately triggers a new sync attempt; the existing local memories are uploaded to `jarvis-second-brain` if that project accepts index creation.
+
+### Can I use a model other than GPT-4.1 Mini?
+
+Yes. In **CONFIG**, replace the model field with any exact OpenRouter text/chat model ID available to your account. The catalog suggestions are conveniences, not an allow-list. Models without reliable JSON instruction following can still answer normally; only automatic durable-fact and task extraction may be less consistent for those models.
 
 ### Voice initialization takes a long time
 
@@ -473,29 +591,46 @@ Verify:
 
 ```bash
 node --version
-npm --version
+pnpm --version
 rustc --version
 cargo --version
 ```
 
 Then confirm the platform dependencies in the [Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/). The first build needs several gigabytes of free disk space.
 
+### The packaged app opens but its server does not start
+
+Rebuild with `pnpm desktop:build`; do not manually copy `.next/standalone` into an app bundle. The preparation script must materialize pnpm dependencies, copy the Moss native package, and embed Node. Confirm that no unrelated process is already listening on port 3000:
+
+```bash
+lsof -nP -iTCP:3000 -sTCP:LISTEN
+```
+
+### The desktop CONFIG panel does not show browser credentials
+
+This is expected. Safari/Chrome and Tauri use separate storage. Enter the credentials once in the desktop CONFIG panel or provide them through `.env.local` for development.
+
 ## Validation commands
 
 ```bash
-npm run typecheck
-npm run build
+pnpm typecheck
+pnpm build
+pnpm desktop:build
 ```
 
 ## Primary references
 
 - [Moss sessions](https://docs.moss.dev/docs/integrate/sessions)
-- [Moss live-call context](https://docs.moss.dev/docs/build/live-call-context)
+- [Moss storage and persistence](https://docs.moss.dev/docs/integrate/storage-persistence)
+- [Moss pricing and limits](https://docs.moss.dev/docs/pricing)
 - [Moss metadata filtering](https://docs.moss.dev/docs/integrate/metadata-filtering)
 - [Moss JavaScript SDK reference](https://docs.moss.dev/docs/reference/js/api)
 - [Moss repository and ElevenLabs example](https://github.com/usemoss/moss/tree/main/apps/elevenlabs-moss)
 - [Porcupine Web quick start](https://picovoice.ai/docs/quick-start/porcupine-web/)
 - [Cheetah Web quick start](https://picovoice.ai/docs/quick-start/cheetah-web/)
 - [OpenRouter quick start](https://openrouter.ai/docs/quickstart)
+- [OpenRouter models](https://openrouter.ai/docs/guides/overview/models)
 - [ElevenLabs text-to-speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert)
 - [Tauri 2 configuration reference](https://v2.tauri.app/reference/config/)
+- [Tauri external binaries](https://v2.tauri.app/develop/sidecar/)
+- [Tauri macOS application bundles](https://v2.tauri.app/distribute/macos-application-bundle/)

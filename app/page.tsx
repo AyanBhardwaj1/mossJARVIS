@@ -4,8 +4,10 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { JarvisVoiceEngine } from "@/lib/voice-engine";
 
 type CoreState = "booting" | "idle" | "listening" | "thinking" | "speaking" | "offline";
+type MemoryMode = "syncing" | "moss" | "moss-local" | "local";
 type FeedItem = { id: string; role: "user" | "jarvis" | "system"; text: string; time: string };
 type Task = { id?: string; title: string; due?: string; priority?: string };
+type ModelOption = { id: string; name: string };
 type ConfigValues = {
   mossProjectId: string;
   mossProjectKey: string;
@@ -44,6 +46,11 @@ function shortDue(value?: string) {
   return date.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }).toUpperCase();
 }
 
+function isMossFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /moss|cloud error|usage_limit|index limit|session expired|session not found/i.test(message);
+}
+
 async function postJarvis<T>(body: Record<string, unknown>): Promise<T> {
   const response = await fetch("/api/jarvis", {
     method: "POST",
@@ -74,22 +81,25 @@ export default function JarvisHud() {
   const [feed, setFeed] = useState<FeedItem[]>(initialFeed);
   const [query, setQuery] = useState("");
   const [partial, setPartial] = useState("");
-  const [tasks, setTasks] = useState<Task[]>([
-    { id: "demo-a", title: "Review open project vectors", due: "unscheduled", priority: "normal" },
-    { id: "demo-b", title: "Calibrate morning briefing", due: new Date().toISOString(), priority: "high" },
-  ]);
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [memoryDocs, setMemoryDocs] = useState(0);
   const [memoryMs, setMemoryMs] = useState(0);
   const [recalled, setRecalled] = useState(0);
+  const [memoryMode, setMemoryMode] = useState<MemoryMode>("syncing");
   const [voiceReady, setVoiceReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [config, setConfig] = useState<ConfigValues>(defaultConfig);
   const [configLinks, setConfigLinks] = useState({ moss: false, openRouter: false, elevenLabs: false, picovoice: false });
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [savingConfig, setSavingConfig] = useState(false);
   const [pipeline, setPipeline] = useState([0, 0, 0]);
   const voiceRef = useRef<JarvisVoiceEngine | null>(null);
   const submitRef = useRef<(text: string) => void>(() => undefined);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const queryInputRef = useRef<HTMLInputElement | null>(null);
+  const memoryNoticeRef = useRef("");
+  const minimumReady = configLinks.moss && configLinks.openRouter;
+  const turnBusy = coreState === "thinking" || coreState === "speaking" || coreState === "booting";
 
   useEffect(() => {
     setClock(new Date());
@@ -99,6 +109,7 @@ export default function JarvisHud() {
 
   useEffect(() => {
     let cancelled = false;
+    let textProvidersLinked = false;
     void (async () => {
       let saved = defaultConfig;
       try {
@@ -117,22 +128,55 @@ export default function JarvisHud() {
         if (cancelled) return;
         const links = { ...statusData.config, picovoice: Boolean(saved.picovoiceAccessKey || process.env.NEXT_PUBLIC_PICOVOICE_ACCESS_KEY) };
         setConfigLinks(links);
-        if (!links.moss) {
+        textProvidersLinked = links.moss && links.openRouter;
+        if (!links.moss || !links.openRouter) {
           setCoreState("offline");
-          setStatus("MOSS CREDENTIALS REQUIRED");
+          setStatus(!links.moss ? "MOSS CREDENTIALS REQUIRED" : "OPENROUTER API KEY REQUIRED");
           setSettingsOpen(true);
           return;
         }
 
-        const data = await postJarvis<{ id: string; memoryDocs: number }>({ action: "init", config: saved });
+        void postJarvis<{ models: ModelOption[] }>({ action: "models", config: saved })
+          .then((modelData) => {
+            if (!cancelled) setModelOptions(modelData.models);
+          })
+          .catch(() => undefined);
+
+        const data = await postJarvis<{ id: string; memoryDocs: number; memoryOnline: boolean; localMossReady: boolean; memoryError?: string }>({ action: "init", config: saved });
         if (cancelled) return;
         setSessionId(data.id);
         setMemoryDocs(data.memoryDocs);
+        setMemoryMode(data.memoryOnline ? "moss" : data.localMossReady ? "moss-local" : "local");
         setCoreState("idle");
-        setStatus("AWAITING VOICE COMMAND");
-        setPipeline([100, 100, 100]);
+        setStatus(data.memoryOnline ? (links.picovoice ? "AWAITING VOICE COMMAND" : "TEXT COMMAND CHANNEL ACTIVE") : data.localMossReady ? "TEXT CORE READY // MOSS LOCAL MEMORY" : "TEXT CORE READY // LOCAL MEMORY SAFE");
+        setPipeline([100, data.memoryOnline ? 100 : 70, 100]);
+        if (data.memoryError) {
+          memoryNoticeRef.current = data.memoryError;
+          setFeed((current) => [...current, {
+            id: `system-${Date.now()}`,
+            role: "system" as const,
+            text: `${data.memoryError} Past chats will still be stored on this Mac${data.localMossReady ? " and retrieved by the local Moss engine" : ""}.`,
+            time: nowLabel(),
+          }].slice(-12));
+        }
+        if (!links.picovoice) window.requestAnimationFrame(() => queryInputRef.current?.focus());
       } catch (error) {
         if (cancelled) return;
+        if (textProvidersLinked && isMossFailure(error)) {
+          setSessionId("");
+          setCoreState("idle");
+          setStatus("TEXT CORE READY // MOSS MEMORY DEGRADED");
+          setPipeline([100, 0, 100]);
+          setSettingsOpen(false);
+          setFeed((current) => [...current, {
+            id: `system-${Date.now()}`,
+            role: "system" as const,
+            text: "Moss memory is temporarily unavailable. Direct OpenRouter text mode remains active.",
+            time: nowLabel(),
+          }].slice(-12));
+          window.requestAnimationFrame(() => queryInputRef.current?.focus());
+          return;
+        }
         setCoreState("offline");
         setStatus(error instanceof Error ? error.message.toUpperCase() : "CONFIGURATION REQUIRED");
         setSettingsOpen(true);
@@ -145,7 +189,7 @@ export default function JarvisHud() {
   }, []);
 
   const stateLabel = useMemo(() => {
-    if (coreState === "idle") return voiceReady ? "WAKE LINK ARMED" : "SYSTEM READY";
+    if (coreState === "idle") return voiceReady ? "WAKE LINK ARMED" : "TEXT CORE READY";
     return coreState.toUpperCase();
   }, [coreState, voiceReady]);
 
@@ -197,7 +241,7 @@ export default function JarvisHud() {
 
   const sendTurn = useCallback(async (text: string) => {
     const cleaned = text.trim();
-    if (!cleaned || !sessionId || coreState === "thinking" || coreState === "speaking") return;
+    if (!cleaned || !minimumReady || coreState === "thinking" || coreState === "speaking") return;
     setQuery("");
     setPartial("");
     addFeed("user", cleaned);
@@ -205,29 +249,81 @@ export default function JarvisHud() {
     setStatus("QUERYING DUAL MEMORY LAYERS");
     setPipeline([100, 24, 8]);
     try {
-      window.setTimeout(() => setPipeline([100, 100, 35]), 260);
-      const data = await postJarvis<{
+      const initializeSession = async () => {
+        setStatus("REINITIALIZING SECOND BRAIN");
+        const initialized = await postJarvis<{ id: string; memoryDocs: number; memoryOnline: boolean; localMossReady: boolean; memoryError?: string }>({ action: "init", config });
+        setSessionId(initialized.id);
+        setMemoryDocs(initialized.memoryDocs);
+        setMemoryMode(initialized.memoryOnline ? "moss" : initialized.localMossReady ? "moss-local" : "local");
+        return initialized.id;
+      };
+      const runTurn = (activeSessionId: string) => postJarvis<{
         response: string;
         tasks: Task[];
         memoryMs: number;
         recalled: number;
-        persisted: { pushed: number };
-      }>({ action: "turn", sessionId, text: cleaned });
+        persisted: { stored: number; synced: boolean; error?: string };
+        memoryDocs: number;
+        memoryOnline: boolean;
+        localMossReady: boolean;
+        memoryError?: string;
+      }>({ action: "turn", sessionId: activeSessionId, text: cleaned });
+
+      window.setTimeout(() => setPipeline([100, 100, 35]), 260);
+      let data: Awaited<ReturnType<typeof runTurn>>;
+      try {
+        let activeSessionId = sessionId || await initializeSession();
+        try {
+          data = await runTurn(activeSessionId);
+        } catch (error) {
+          if (!(error instanceof Error) || !/session expired|session not found/i.test(error.message)) throw error;
+          activeSessionId = await initializeSession();
+          data = await runTurn(activeSessionId);
+        }
+      } catch (error) {
+        if (!isMossFailure(error)) throw error;
+        setStatus("MOSS MEMORY DEGRADED — QUERYING OPENROUTER");
+        addFeed("system", "Moss memory is temporarily unavailable. Continuing this turn in direct OpenRouter text mode.");
+        data = await postJarvis<Awaited<ReturnType<typeof runTurn>>>({ action: "chat", text: cleaned, config });
+      }
       setPipeline([100, 100, 100]);
       setMemoryMs(data.memoryMs);
       setRecalled(data.recalled);
-      setMemoryDocs(data.persisted.pushed);
+      setMemoryDocs(data.memoryDocs || data.persisted.stored);
+      setMemoryMode(data.memoryOnline ? "moss" : data.localMossReady ? "moss-local" : "local");
+      if (data.memoryError && memoryNoticeRef.current !== data.memoryError) {
+        memoryNoticeRef.current = data.memoryError;
+        addFeed("system", `${data.memoryError} This turn was saved locally and will be available after restart.`);
+      }
       if (data.tasks.length) {
         setTasks((current) => [...data.tasks.map((task, index) => ({ ...task, id: `new-${Date.now()}-${index}` })), ...current]);
       }
       addFeed("jarvis", data.response);
-      await speak(data.response);
+      if (configLinks.elevenLabs) {
+        await speak(data.response);
+      } else {
+        setCoreState("idle");
+        setStatus(data.memoryOnline ? "TEXT RESPONSE READY // MOSS CLOUD SYNCED" : data.localMossReady ? "TEXT RESPONSE READY // MOSS LOCAL SAVED" : "TEXT RESPONSE READY // LOCAL MEMORY SAVED");
+      }
     } catch (error) {
+      const hasRequiredConfig = Boolean((config.mossProjectId && config.mossProjectKey) || configLinks.moss)
+        && Boolean(config.openRouterApiKey || configLinks.openRouter);
+      if (hasRequiredConfig && isMossFailure(error)) {
+        setSessionId("");
+        setConfigLinks((current) => ({ ...current, moss: true, openRouter: true }));
+        setPipeline([100, 0, 100]);
+        setCoreState("idle");
+        setStatus("TEXT CORE READY // MOSS MEMORY DEGRADED");
+        setSettingsOpen(false);
+        addFeed("system", "Moss memory could not initialize. Direct OpenRouter text mode remains active.");
+        window.requestAnimationFrame(() => queryInputRef.current?.focus());
+        return;
+      }
       setCoreState("offline");
       setStatus(error instanceof Error ? error.message.toUpperCase() : "CORE REQUEST FAILED");
       addFeed("system", error instanceof Error ? error.message : "Core request failed.");
     }
-  }, [addFeed, coreState, sessionId, speak]);
+  }, [addFeed, config, configLinks.elevenLabs, coreState, minimumReady, sessionId, speak]);
 
   submitRef.current = (text: string) => void sendTurn(text);
 
@@ -260,6 +356,16 @@ export default function JarvisHud() {
     }
   }
 
+  function activateCore() {
+    if (configLinks.picovoice) {
+      void armVoice(true);
+      return;
+    }
+    window.requestAnimationFrame(() => queryInputRef.current?.focus());
+    setCoreState("idle");
+    setStatus("TEXT COMMAND CHANNEL ACTIVE");
+  }
+
   function updateConfig(key: keyof ConfigValues, value: string) {
     setConfig((current) => ({ ...current, [key]: value }));
   }
@@ -274,16 +380,32 @@ export default function JarvisHud() {
       const data = await postJarvis<{
         id: string;
         memoryDocs: number;
+        memoryOnline: boolean;
+        localMossReady: boolean;
+        memoryError?: string;
         config: { moss: boolean; openRouter: boolean; elevenLabs: boolean };
       }>({ action: "init", config });
       setSessionId(data.id);
       setMemoryDocs(data.memoryDocs);
+      setMemoryMode(data.memoryOnline ? "moss" : data.localMossReady ? "moss-local" : "local");
       setConfigLinks({ ...data.config, picovoice: Boolean(config.picovoiceAccessKey || process.env.NEXT_PUBLIC_PICOVOICE_ACCESS_KEY) });
-      setPipeline([100, 100, 100]);
+      if (!data.config.openRouter) {
+        setCoreState("offline");
+        setStatus("OPENROUTER API KEY REQUIRED");
+        setSettingsOpen(true);
+        return;
+      }
+      setPipeline([100, data.memoryOnline ? 100 : 70, 100]);
       setCoreState("idle");
-      setStatus("CORE CONFIGURATION ACCEPTED");
+      setStatus(data.memoryOnline ? "TEXT CORE CONFIGURATION ACCEPTED // MOSS CLOUD SYNCED" : data.localMossReady ? "TEXT CORE CONFIGURATION ACCEPTED // MOSS LOCAL READY" : "TEXT CORE CONFIGURATION ACCEPTED // LOCAL MEMORY SAFE");
       setSettingsOpen(false);
-      addFeed("system", "Credentials accepted. Neural core and second brain are online.");
+      addFeed("system", data.memoryOnline
+        ? "Credentials accepted. Local memory and the Moss second brain are synchronized."
+        : `${data.memoryError || "Moss sync is unavailable."} Local persistent memory remains active.`);
+      void postJarvis<{ models: ModelOption[] }>({ action: "models", config })
+        .then((modelData) => setModelOptions(modelData.models))
+        .catch(() => undefined);
+      window.requestAnimationFrame(() => queryInputRef.current?.focus());
     } catch (error) {
       setCoreState("offline");
       setStatus(error instanceof Error ? error.message.toUpperCase() : "CREDENTIAL VALIDATION FAILED");
@@ -300,7 +422,12 @@ export default function JarvisHud() {
       const data = await postJarvis<{ briefing: string; tasks: Task[] }>({ action: "briefing", sessionId });
       setTasks(data.tasks);
       addFeed("jarvis", data.briefing);
-      await speak(data.briefing);
+      if (configLinks.elevenLabs) {
+        await speak(data.briefing);
+      } else {
+        setCoreState("idle");
+        setStatus("TEXT BRIEFING READY");
+      }
     } catch (error) {
       setCoreState("offline");
       setStatus(error instanceof Error ? error.message.toUpperCase() : "BRIEFING FAILED");
@@ -358,13 +485,13 @@ export default function JarvisHud() {
           <section className="readout-panel system-panel">
             <div className="section-tag">SYSTEM DIAGNOSTICS</div>
             <RadialGauge value={coreState === "thinking" ? 82 : 36} label="NEURAL LOAD" />
-            <Metric label="MOSS LATENCY" value={memoryMs ? `${memoryMs.toFixed(1)} MS` : "STANDBY"} width={memoryMs ? 92 : 28} />
+            <Metric label={memoryMode === "moss" ? "MOSS LATENCY" : memoryMode === "moss-local" ? "MOSS LOCAL" : "LOCAL MEMORY"} value={memoryMs ? `${memoryMs.toFixed(1)} MS` : memoryMode === "moss" ? "SYNCED" : "DISK SAFE"} width={memoryMode === "moss" ? 92 : 70} />
             <Metric label="MEMORY RECALL" value={`${recalled} VECTORS`} width={Math.min(100, recalled * 9)} />
             <Metric label="VOICE MATRIX" value={voiceReady ? "ARMED" : "LOCAL"} width={voiceReady ? 100 : 42} />
           </section>
 
           <nav className="quick-actions">
-            <button className={voiceReady ? "active" : ""} onClick={() => void armVoice(false)}><HudIcon name="mic"/><span>ARM VOICE</span></button>
+            <button className={voiceReady ? "active" : ""} onClick={() => configLinks.picovoice ? void armVoice(false) : setSettingsOpen(true)}><HudIcon name="mic"/><span>{configLinks.picovoice ? "ARM VOICE" : "ADD VOICE"}</span></button>
             <button onClick={() => void requestBriefing()}><HudIcon name="brief"/><span>BRIEFING</span></button>
             <button onClick={() => setSettingsOpen(true)}><HudIcon name="settings"/><span>CONFIG</span></button>
           </nav>
@@ -373,7 +500,7 @@ export default function JarvisHud() {
         <section className="core-stage">
           <div className="coordinate x" /><div className="coordinate y" />
           <div className="target-brackets"><i/><i/><i/><i/></div>
-          <button className="reactor" onClick={() => void armVoice(true)} aria-label="Activate voice input">
+          <button className="reactor" onClick={activateCore} aria-label={configLinks.picovoice ? "Activate voice input" : "Activate text input"}>
             <span className="orbit orbit-a"><i/><i/><i/></span>
             <span className="orbit orbit-b" />
             <span className="orbit orbit-c" />
@@ -381,7 +508,7 @@ export default function JarvisHud() {
             <span className="core-disc">
               <span className="core-hex"><b>J</b></span>
               <em>{stateLabel}</em>
-              <small>{coreState === "listening" ? "VOICE CHANNEL 01" : "ARC REACTOR // MK VII"}</small>
+              <small>{coreState === "listening" ? "VOICE CHANNEL 01" : configLinks.picovoice ? "ARC REACTOR // MK VII" : "TEXT INTERFACE // READY"}</small>
             </span>
             <span className="tick-ring" />
           </button>
@@ -389,7 +516,7 @@ export default function JarvisHud() {
           <div className="state-caption">
             <span className="live-dot" />
             <strong>{status}</strong>
-            <small>{coreState === "offline" ? "OPEN CONFIGURATION TO COMPLETE LINK" : "CLICK CORE OR SAY “JARVIS”"}</small>
+            <small>{coreState === "offline" ? "OPEN CONFIGURATION TO COMPLETE LINK" : configLinks.picovoice ? "CLICK CORE OR SAY “JARVIS”" : "TYPE A DIRECTIVE BELOW — VOICE IS OPTIONAL"}</small>
           </div>
 
           <div className="pipeline-readout">
@@ -423,9 +550,9 @@ export default function JarvisHud() {
           </section>
 
           <section className="memory-panel">
-            <div className="panel-title"><span><HudIcon name="memory"/>SECOND BRAIN</span><b>SYNC</b></div>
+            <div className="panel-title"><span><HudIcon name="memory"/>SECOND BRAIN</span><b>{memoryMode === "moss" ? "CLOUD SYNC" : memoryMode === "moss-local" ? "MOSS LOCAL" : memoryMode === "local" ? "LOCAL SAFE" : "SYNCING"}</b></div>
             <div className="memory-graphic"><i/><i/><i/><i/><b>{memoryDocs}</b><small>DOCUMENTS</small></div>
-            <div className="memory-stats"><span>WORKING <b>LOCAL</b></span><span>LONG-TERM <b>CLOUD</b></span></div>
+            <div className="memory-stats"><span>WORKING <b>LOCAL</b></span><span>LONG-TERM <b>{memoryMode === "moss" ? "MOSS CLOUD" : memoryMode === "moss-local" ? "MOSS + DISK" : "LOCAL DISK"}</b></span></div>
           </section>
         </aside>
       </div>
@@ -440,8 +567,17 @@ export default function JarvisHud() {
         </div>
         <form onSubmit={submit}>
           <span className="prompt-mark">›_</span>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="ENTER DIRECTIVE OR CLICK THE ARC CORE TO SPEAK..." disabled={!sessionId}/>
-          <button disabled={!query.trim() || !sessionId}>TRANSMIT</button>
+          <input
+            ref={queryInputRef}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={minimumReady ? (configLinks.picovoice ? "ENTER DIRECTIVE OR CLICK THE ARC CORE TO SPEAK..." : "ENTER A DIRECTIVE FOR JARVIS — PRESS RETURN TO SEND...") : "ADD MOSS + OPENROUTER CREDENTIALS IN CONFIG..."}
+            disabled={!minimumReady}
+            aria-label="Jarvis text command"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button disabled={!query.trim() || !minimumReady || turnBusy}>TRANSMIT</button>
         </form>
       </section>
 
@@ -449,19 +585,23 @@ export default function JarvisHud() {
         <div className="modal-backdrop" onMouseDown={() => setSettingsOpen(false)}>
           <section className="config-modal" onMouseDown={(event) => event.stopPropagation()}>
             <div className="panel-title"><span><HudIcon name="settings"/>SYSTEM CONFIGURATION</span><button onClick={() => setSettingsOpen(false)}>×</button></div>
-            <p>Credentials are stored only in this browser and transmitted to your local Jarvis server. Password fields remain masked.</p>
+            <p><strong>Text mode only requires Moss and OpenRouter.</strong> Every completed turn is written to a private local data file first, then synchronized to the `jarvis-second-brain` Moss index when Moss is available. ElevenLabs and Picovoice are optional upgrades. Credentials are stored in this browser and transmitted to your local Jarvis server.</p>
             <form className="config-form" onSubmit={saveConfiguration}>
-              <ConfigGroup title="MOSS // PERSISTENT MEMORY" ready={configLinks.moss}>
+              <ConfigGroup title="MOSS // PERSISTENT MEMORY" ready={configLinks.moss} required>
                 <ConfigField label="PROJECT ID" value={config.mossProjectId} onChange={(value) => updateConfig("mossProjectId", value)} placeholder="Moss project ID" />
                 <ConfigField secret label="PROJECT KEY" value={config.mossProjectKey} onChange={(value) => updateConfig("mossProjectKey", value)} placeholder="Moss project key" />
               </ConfigGroup>
 
-              <ConfigGroup title="OPENROUTER // REASONING" ready={configLinks.openRouter}>
+              <ConfigGroup title="OPENROUTER // REASONING" ready={configLinks.openRouter} required>
                 <ConfigField secret label="API KEY" value={config.openRouterApiKey} onChange={(value) => updateConfig("openRouterApiKey", value)} placeholder={configLinks.openRouter ? "Already linked — leave blank to keep" : "sk-or-v1-..."} />
-                <ConfigField label="MODEL" value={config.openRouterModel} onChange={(value) => updateConfig("openRouterModel", value)} placeholder="openai/gpt-4.1-mini" />
+                <ConfigField label="MODEL SLUG — ANY OPENROUTER CHAT MODEL" value={config.openRouterModel} onChange={(value) => updateConfig("openRouterModel", value)} placeholder="e.g. anthropic/..., google/..., openai/..." list="openrouter-model-options" />
+                <datalist id="openrouter-model-options">
+                  {modelOptions.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+                </datalist>
+                <small className="model-help">Choose from the suggestions or enter any exact model ID from OpenRouter. GPT‑4.1 Mini is only the initial default.</small>
               </ConfigGroup>
 
-              <ConfigGroup title="ELEVENLABS // VOICE" ready={configLinks.elevenLabs}>
+              <ConfigGroup title="ELEVENLABS // SPOKEN OUTPUT" ready={configLinks.elevenLabs}>
                 <ConfigField secret label="API KEY" value={config.elevenLabsApiKey} onChange={(value) => updateConfig("elevenLabsApiKey", value)} placeholder="ElevenLabs API key" />
                 <ConfigField label="VOICE ID" value={config.elevenLabsVoiceId} onChange={(value) => updateConfig("elevenLabsVoiceId", value)} placeholder="George (British) voice ID" />
               </ConfigGroup>
@@ -471,7 +611,7 @@ export default function JarvisHud() {
               </ConfigGroup>
 
               <button className="save-config" type="submit" disabled={savingConfig}>
-                {savingConfig ? "VALIDATING CONNECTIONS..." : "SAVE KEYS & INITIALIZE CORE"}
+                {savingConfig ? "VALIDATING REQUIRED CONNECTIONS..." : "SAVE & INITIALIZE TEXT CORE"}
               </button>
             </form>
           </section>
@@ -492,17 +632,19 @@ function RadialGauge({ value, label }: { value: number; label: string }) {
 function ConfigGroup({
   title,
   ready,
+  required = false,
   single = false,
   children,
 }: {
   title: string;
   ready: boolean;
+  required?: boolean;
   single?: boolean;
   children: React.ReactNode;
 }) {
   return (
     <fieldset className={single ? "config-group single" : "config-group"}>
-      <legend><span>{title}</span><b className={ready ? "ready" : "pending"}>{ready ? "LINKED" : "PENDING"}</b></legend>
+      <legend><span>{title}<em>{required ? "REQUIRED" : "OPTIONAL"}</em></span><b className={ready ? "ready" : "pending"}>{ready ? "LINKED" : required ? "REQUIRED" : "NOT CONFIGURED"}</b></legend>
       <div className="config-grid">{children}</div>
     </fieldset>
   );
@@ -512,12 +654,14 @@ function ConfigField({
   label,
   value,
   placeholder,
+  list,
   secret = false,
   onChange,
 }: {
   label: string;
   value: string;
   placeholder: string;
+  list?: string;
   secret?: boolean;
   onChange: (value: string) => void;
 }) {
@@ -528,6 +672,7 @@ function ConfigField({
         type={secret ? "password" : "text"}
         value={value}
         placeholder={placeholder}
+        list={list}
         onChange={(event) => onChange(event.target.value)}
         autoComplete="off"
         spellCheck={false}
