@@ -13,6 +13,8 @@ The repository can run as:
 - Any OpenRouter text/chat model slug can be selected; GPT-4.1 Mini is only the default value.
 - Every successful turn is written to private local storage before any Moss Cloud request.
 - Moss local retrieval remains operational when cloud index, ingest, or monthly usage quota is unavailable.
+- The compact **SECOND BRAIN** HUD card opens a full-screen cognitive archive with search, recency ranking, memory inspection, semantic neighbors, an interactive connection graph, direct memory writes, and multi-source ingestion.
+- Notes, Markdown, plain text, PDF, Word, HTML, CSV/log files, ChatGPT/Claude/generic AI chat-export JSON, public articles, and public YouTube transcripts can be brought into the same searchable memory space.
 - The macOS build is self-contained: `Jarvis.app` carries Next.js standalone output, pnpm dependencies, Moss's native Apple Silicon module, and Node itself.
 - Browser and desktop WebView credentials are separate because each has its own `localStorage`.
 
@@ -26,6 +28,8 @@ The repository can run as:
 | Conversational reasoning | OpenRouter Chat Completions with a configurable model |
 | Live conversational memory | In-process recent-turn buffer plus a Moss local `SessionIndex` |
 | Persistent second brain | Private local JSON + Moss local index, with automatic Moss Cloud synchronization when quota permits |
+| Full-screen memory workspace | Clickable archive with search, filters, full text, related memories, stats, ingestion, direct remember, delete, and an interactive graph |
+| Knowledge ingestion | Heading-aware deterministic chunking for text/documents/chat exports plus public article and YouTube transcript capture |
 | Task capture | OpenRouter returns structured tasks; Jarvis stores them as Moss documents with metadata |
 | Morning briefing | Reads open task documents from Moss and asks OpenRouter to produce a concise spoken briefing |
 | Speech output | Optional ElevenLabs text-to-speech; OS speech synthesis is used only if an enabled ElevenLabs request/playback fails |
@@ -50,6 +54,32 @@ In this project Moss contributes:
 7. **Cloud persistence.** When the project has available Moss quota, Jarvis creates or updates the single `jarvis-second-brain` cloud index through `createIndex()` / `addDocs()` and refreshes it with `loadIndex()`.
 8. **Fail-safe persistence.** If Moss Cloud returns a quota or network error, the HUD reports `MOSS LOCAL`; the turn is still stored on disk and indexed by the local Moss engine. A later initialization retries cloud synchronization.
 9. **Retrieval telemetry.** Query duration and retrieved-document counts are exposed in the HUD as Moss latency and memory recall metrics.
+10. **Semantic connection graph.** Jarvis compares source-level custom embeddings, keeps each source's strongest neighbors, and renders the resulting weighted graph as an interactive canvas.
+11. **Direct episodic memory.** The full-screen archive can write a timestamped fact, decision, preference, or event straight to local storage and the Moss index without spending an LLM call.
+
+### Full-screen Second Brain workspace
+
+Click the **SECOND BRAIN** card on the right side of the main HUD. The archive takes over the Jarvis window and provides four workspaces:
+
+| Workspace | What it does |
+| --- | --- |
+| **Memories** | Lists durable chunks, performs semantic search, filters by memory type, optionally re-ranks dated content for recency, shows complete stored text, traverses semantic neighbors, opens original URLs, and deletes individual vectors |
+| **Graph** | Builds a source-level knowledge graph from local embeddings; drag to pan, scroll to zoom, and click a node to open all chunks from that source |
+| **Ingest** | Imports supported files and public links, sanitizes prompt-role markers, extracts readable text, splits on Markdown headings, creates deterministic chunk IDs, embeds locally, and then attempts Moss Cloud synchronization |
+| **Remember** | Writes a titled/tagged episodic memory directly to the canonical local store and Moss local index without calling OpenRouter |
+
+The integration adapts the architecture and ingestion ideas from [Naut1cal5/moss-brain](https://github.com/Naut1cal5/moss-brain), an MIT-licensed project by Aarush Nigam. Jarvis implements those ideas natively in TypeScript so the packaged Tauri app does not require Python, `pip`, a separate MCP server, or an Obsidian installation. See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
+
+#### Ingestion behavior
+
+- Files: `.md`, `.markdown`, `.txt`, `.rst`, `.org`, `.csv`, `.log`, `.html`, `.htm`, `.pdf`, `.docx`, and AI chat-export `.json`.
+- Links: public HTTP(S) articles and public YouTube videos with an available English transcript.
+- Safety: localhost and private-network link ingestion is rejected; script/navigation boilerplate is removed from HTML; known model-role control markers are neutralized before indexing.
+- Chunking: Markdown headings define semantic sections, large sections are capped at approximately 3,600 characters, and IDs derive from `source + section + part`, so re-importing the same source updates rather than duplicates those chunks.
+- Parsing: ChatGPT, Claude, and vendor-neutral `role`/`content`-shaped exports are mapped into question/answer archives. PDF extraction uses `pdf-parse`; Word extraction uses `mammoth`.
+- Persistence: the canonical JSON archive is updated first, the local Moss `SessionIndex` second, and the optional private Moss Cloud index last.
+
+The upstream CLI/MCP-only capabilities that do not map directly to the current desktop UI—continuous filesystem watching, writing `[[wikilinks]]` into an Obsidian vault, and serving memory to other applications over MCP—remain outside Jarvis for now.
 
 This uses Moss's documented custom-embedding, local-session, index mutation, `loadIndex()`, and query APIs. See the [Moss client reference](https://docs.moss.dev/docs/reference/js/classes/MossClient) and [storage/persistence guide](https://docs.moss.dev/docs/integrate/storage-persistence).
 
@@ -305,12 +335,15 @@ When no task documents are open, Jarvis returns a deterministic no-tasks briefin
 ```text
 app/
 ├── page.tsx                    HUD, state machine, settings, transcript, audio playback
+├── second-brain.tsx            Full-screen archive, ingestion/remember UI, semantic graph canvas
 ├── globals.css                 HUD visuals and state-specific reactor animations
 └── api/jarvis/
-    ├── route.ts                Init, status, turn, briefing, OpenRouter orchestration
+    ├── route.ts                Init, chat, briefing, memory browser/search/graph actions
+    ├── brain/ingest/route.ts   Multipart file/link extraction and durable ingestion
     └── tts/route.ts            ElevenLabs text-to-speech proxy
 
 lib/
+├── brain-ingest.ts             Sanitization, parsers, URL capture, deterministic chunking
 ├── jarvis-store.ts             Local-first store, custom embeddings, Moss sync/retrieval, tasks
 ├── runtime-config.ts           Runtime provider configuration and environment fallback
 └── voice-engine.ts             Porcupine/Cheetah worker lifecycle and microphone routing
@@ -483,8 +516,16 @@ All Jarvis orchestration uses `POST /api/jarvis`.
 | `chat` | `text` | Emergency direct OpenRouter turn when no memory session can be recovered |
 | `briefing` | `sessionId` | Returns the spoken briefing and current open tasks |
 | `memory-search` | `sessionId`, `text` | Diagnostic retrieval against working and long-term memory |
+| `brain-list` / `brain-search` | `sessionId`; optional `text`, `type`, `source`, `recent`, `limit` | Full-screen archive listing or semantic search |
+| `brain-related` | `sessionId`, `memoryId` | Semantically adjacent source memories |
+| `brain-remember` | `sessionId`, `text`; optional `title`, `tags` | Direct durable episodic-memory write without an LLM call |
+| `brain-stats` | `sessionId` | Counts, storage mode/path, and graph connection total |
+| `brain-graph` | `sessionId` | Source nodes and weighted embedding-similarity edges |
+| `brain-delete` | `sessionId`, `memoryId` | Deletes one local vector and mirrors deletion to Moss when available |
 
 `POST /api/jarvis/tts` accepts `{ "text": "..." }` and returns `audio/mpeg` when ElevenLabs succeeds.
+
+`POST /api/jarvis/brain/ingest` accepts multipart form data with `sessionId`, zero or more `file` fields, and zero or more public `url` fields. A file is limited to 25 MB and a batch to 60 MB.
 
 ## Network and privacy boundaries
 
@@ -494,6 +535,7 @@ All Jarvis orchestration uses `POST /api/jarvis`.
 | User transcript | Local Next.js API, local memory files, OpenRouter, and Moss Cloud only when sync succeeds | Memory, retrieval, and response generation |
 | Retrieved Moss context | OpenRouter | Grounding the response in relevant memory |
 | Conversation record, extracted facts, tasks | Private local data file first; Moss Cloud through `addDocs()` when available | Guaranteed local persistence and optional cross-device sync |
+| Imported files and public-link text | Local extraction, private local data file, local Moss index, and optional private Moss Cloud index | Searchable knowledge ingestion |
 | Final response text | ElevenLabs | Speech synthesis |
 | Runtime credentials entered in the UI | Browser `localStorage` and local Next.js process | Runtime provider configuration |
 
@@ -544,7 +586,7 @@ GitHub users build their own architecture-matched Node/Tauri bundle with `pnpm d
 
 ## Current limitations
 
-- Task completion, editing, and deletion are not yet exposed in the HUD.
+- Task completion and editing are not yet exposed in the HUD. Individual Second Brain chunks can be deleted from the full-screen archive.
 - Tasks are memory documents, not operating-system notifications or background alarms.
 - Recurrence is stored but not expanded into future task instances.
 - Raw working turns are process-local; completed exchanges are durable conversation documents.
@@ -552,6 +594,8 @@ GitHub users build their own architecture-matched Node/Tauri bundle with `pnpm d
 - There is no account/user namespace beyond the configured Moss project and index name.
 - Runtime credentials use browser storage rather than the macOS Keychain or Tauri Stronghold.
 - The generated macOS app is locally built and not notarized for public distribution.
+- The desktop UI imports selected files rather than continuously watching arbitrary folders.
+- The integration does not currently write Obsidian `[[wikilinks]]` or expose Jarvis memory as an MCP server to other applications.
 
 ## Troubleshooting
 
@@ -620,6 +664,7 @@ pnpm desktop:build
 
 ## Primary references
 
+- [Naut1cal5/moss-brain](https://github.com/Naut1cal5/moss-brain)
 - [Moss sessions](https://docs.moss.dev/docs/integrate/sessions)
 - [Moss storage and persistence](https://docs.moss.dev/docs/integrate/storage-persistence)
 - [Moss pricing and limits](https://docs.moss.dev/docs/pricing)

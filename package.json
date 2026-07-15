@@ -18,7 +18,9 @@
     "@picovoice/porcupine-web": "^4.0.1",
     "@picovoice/web-voice-processor": "^4.0.10",
     "@tauri-apps/api": "^2.11.1",
+    "mammoth": "1.9.1",
     "next": "^15.3.4",
+    "pdf-parse": "1.1.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
@@ -26,6 +28,7 @@
     "@tailwindcss/postcss": "^4.1.10",
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^22.15.34",
+    "@types/pdf-parse": "1.1.5",
     "@types/react": "^19.0.12",
     "@types/react-dom": "^19.0.4",
     "tailwindcss": "^4.1.10",

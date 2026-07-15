@@ -1,10 +1,16 @@
 import { NextResponse } from "next/server";
 import {
   addWorkingTurn,
+  brainStats,
+  buildBrainGraph,
   createJarvisSession,
+  deleteBrainMemory,
   openTasks,
   persistTurn,
   queryBoth,
+  relatedBrainMemories,
+  rememberInBrain,
+  searchBrain,
   type JarvisTask,
   type RetrievedMemory,
 } from "@/lib/jarvis-store";
@@ -195,6 +201,43 @@ export async function POST(request: Request) {
     if (action === "briefing") {
       const tasks = await openTasks(sessionId);
       return NextResponse.json({ briefing: await makeBriefing(tasks), tasks });
+    }
+
+    if (action === "brain-list" || action === "brain-search") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      const limit = typeof body.limit === "number" ? body.limit : 40;
+      const recent = body.recent === true;
+      const type = typeof body.type === "string" ? body.type : "all";
+      const source = typeof body.source === "string" ? body.source : undefined;
+      return NextResponse.json(await searchBrain(sessionId, text, { limit, recent, type, source }));
+    }
+
+    if (action === "brain-related") {
+      const memoryId = typeof body.memoryId === "string" ? body.memoryId : "";
+      if (!memoryId) return errorResponse(new Error("Missing memory ID."), 400);
+      return NextResponse.json(await relatedBrainMemories(sessionId, memoryId));
+    }
+
+    if (action === "brain-remember") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) return errorResponse(new Error("Enter something worth remembering."), 400);
+      const title = typeof body.title === "string" ? body.title : undefined;
+      const tags = Array.isArray(body.tags) ? body.tags.filter((tag): tag is string => typeof tag === "string") : [];
+      return NextResponse.json(await rememberInBrain(sessionId, text, { title, tags }));
+    }
+
+    if (action === "brain-stats") {
+      return NextResponse.json(await brainStats(sessionId));
+    }
+
+    if (action === "brain-graph") {
+      return NextResponse.json(await buildBrainGraph(sessionId));
+    }
+
+    if (action === "brain-delete") {
+      const memoryId = typeof body.memoryId === "string" ? body.memoryId : "";
+      if (!memoryId) return errorResponse(new Error("Missing memory ID."), 400);
+      return NextResponse.json(await deleteBrainMemory(sessionId, memoryId));
     }
 
     if (action === "memory-search") {

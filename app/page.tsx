@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { JarvisVoiceEngine } from "@/lib/voice-engine";
+import { SecondBrain } from "@/app/second-brain";
 
 type CoreState = "booting" | "idle" | "listening" | "thinking" | "speaking" | "offline";
 type MemoryMode = "syncing" | "moss" | "moss-local" | "local";
@@ -88,6 +89,7 @@ export default function JarvisHud() {
   const [memoryMode, setMemoryMode] = useState<MemoryMode>("syncing");
   const [voiceReady, setVoiceReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [brainOpen, setBrainOpen] = useState(false);
   const [config, setConfig] = useState<ConfigValues>(defaultConfig);
   const [configLinks, setConfigLinks] = useState({ moss: false, openRouter: false, elevenLabs: false, picovoice: false });
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
@@ -549,11 +551,12 @@ export default function JarvisHud() {
             <button className="outline-button" onClick={() => void requestBriefing()}>GENERATE MORNING BRIEFING <span>↗</span></button>
           </section>
 
-          <section className="memory-panel">
+          <button className="memory-panel memory-launch" type="button" onClick={() => setBrainOpen(true)} aria-label="Open full-screen Second Brain">
             <div className="panel-title"><span><HudIcon name="memory"/>SECOND BRAIN</span><b>{memoryMode === "moss" ? "CLOUD SYNC" : memoryMode === "moss-local" ? "MOSS LOCAL" : memoryMode === "local" ? "LOCAL SAFE" : "SYNCING"}</b></div>
             <div className="memory-graphic"><i/><i/><i/><i/><b>{memoryDocs}</b><small>DOCUMENTS</small></div>
             <div className="memory-stats"><span>WORKING <b>LOCAL</b></span><span>LONG-TERM <b>{memoryMode === "moss" ? "MOSS CLOUD" : memoryMode === "moss-local" ? "MOSS + DISK" : "LOCAL DISK"}</b></span></div>
-          </section>
+            <span className="memory-open-label">OPEN COGNITIVE ARCHIVE ↗</span>
+          </button>
         </aside>
       </div>
 
@@ -617,6 +620,14 @@ export default function JarvisHud() {
           </section>
         </div>
       )}
+
+      <SecondBrain
+        open={brainOpen}
+        sessionId={sessionId}
+        config={config}
+        onClose={() => setBrainOpen(false)}
+        onDocumentCount={setMemoryDocs}
+      />
     </main>
   );
 }
